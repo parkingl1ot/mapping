@@ -5,11 +5,11 @@ from pathlib import Path
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
+from mapping_list import *
+
 
 SOURCE_FILE = Path(r"C:\Users\xlin075\Documents\mapping\Book.xlsx")
 OUTPUT_DIR = SOURCE_FILE.parent
-KEYWORDS = ["社保", "工资", "公积", "年终奖", "劳务费"]
-TARGET_VALUE = "人事费用"
 LOG_PATH = OUTPUT_DIR / "processing_error_log.txt"
 CONFLICT_PATH = OUTPUT_DIR / "mapping_conflicts.txt"
 
@@ -23,10 +23,10 @@ def log_error(message: str, exc: Exception | None = None) -> None:
         f.write(text)
 
 
-def contains_keyword(value) -> bool:
+def contains_keyword(value, category) -> bool:
     if not value:
         return False
-    for keyword in KEYWORDS:
+    for keyword in summary.get(category):
         if keyword in value:
             return True
     return False
@@ -39,7 +39,8 @@ def make_copy_path() -> Path:
 
 def get_header_lookup(ws):
     for row in ws.iter_rows(min_row=1, max_row=min(ws.max_row, 20), values_only=True):
-        if any(v for v in row):
+        cell_count = sum(1 for v in row if v is not None)
+        if cell_count>11:
             return {str(v).strip(): idx + 1 for idx, v in enumerate(row) if v is not None}
     return {}
 
@@ -61,51 +62,54 @@ def process_workbook(source_path: Path, copy_path: Path):
     for sheet in copied_wb.worksheets:
         print(f"[4/7] Processing sheet: {sheet.title}")
         header_lookup = get_header_lookup(sheet)
-        target_index = header_lookup.get("摘要mapping", 10)
+        target_index = header_lookup.get("摘要mapping")
         trigger_indexes = [9, 11, 16, 17]
 
         if "摘要mapping" not in header_lookup:
-            print(f"  - No '摘要mapping' header found in {sheet.title} column J.")
+            log_error(f"  - No '摘要mapping' header found in {sheet.title}, please check the format of the book", Exception)
+            print(f"  - No '摘要mapping' header found in {sheet.title}")
+            continue
 
         max_row = sheet.max_row
         print(f"  - Data rows checked: {max_row - 1}")
 
-        for row_idx in range(2, max_row + 1):
-            total_rows_processed += 1
-            try:
-                ex_value = sheet.cell(row=row_idx, column=target_index).value
-                trigger_hit = False
+        for category in summary.keys():
+            for row_idx in range(2, max_row + 1):
+                total_rows_processed += 1
+                try:
+                    ex_value = sheet.cell(row=row_idx, column=target_index).value
+                    trigger_hit = False
 
-                for col_idx in trigger_indexes:
-                    cell_value = str(sheet.cell(row=row_idx, column=col_idx).value)
-                    if contains_keyword(cell_value):
-                        trigger_hit = True
-                        break
+                    for col_idx in trigger_indexes:
+                        cell_value = str(sheet.cell(row=row_idx, column=col_idx).value)
+                        if contains_keyword(cell_value, category):
+                            trigger_hit = True
+                            break
 
-                if not trigger_hit:
-                    continue
+                    if not trigger_hit:
+                        continue
 
-                if ex_value:
-                    conflicts.append({
-                        "sheet": sheet.title,
-                        "row": row_idx,
-                        "existing_value": ex_value,
-                        "proposed_value": TARGET_VALUE,
-                        "trigger_columns": [str(get_column_letter(c) for c in trigger_indexes)],
-                    })
-                    print(
-                        f"  - Conflict at sheet={sheet.title}, row={row_idx}: "
-                        f"existing J='{ex_value}', proposed '{TARGET_VALUE}'."
-                    )
-                    continue
+                    if ex_value:
+                        conflicts.append({
+                            "sheet": sheet.title,
+                            "row": row_idx,
+                            "existing_value": ex_value,
+                            "proposed_value": category,
+                            "trigger_columns": [str(get_column_letter(c) for c in trigger_indexes)],
+                        })
+                        print(
+                            f"  - Conflict at sheet={sheet.title}, row={row_idx}: "
+                            f"existing content='{ex_value}', proposed '{category}'."
+                        )
+                        continue
 
-                sheet.cell(row=row_idx, column=target_index, value=TARGET_VALUE)
-                total_updates += 1
-                print(f"  - Updated sheet={sheet.title}, row={row_idx} => {TARGET_VALUE}")
-            except Exception as exc:
-                errors.append((sheet.title, row_idx, str(exc)))
-                log_error(f"Error while processing sheet={sheet.title}, row={row_idx}", exc)
-                print(f"  - Error on sheet={sheet.title}, row={row_idx}: {exc}")
+                    sheet.cell(row=row_idx, column=target_index, value=category)
+                    total_updates += 1
+                    print(f"  - Updated sheet={sheet.title}, row={row_idx} => {category}")
+                except Exception as exc:
+                    errors.append((sheet.title, row_idx, str(exc)))
+                    log_error(f"Error while processing sheet={sheet.title}, row={row_idx}", exc)
+                    print(f"  - Error on sheet={sheet.title}, row={row_idx}: {exc}")
 
     print("[5/7] Saving updated workbook copy...")
     copied_wb.save(copy_path)
@@ -117,7 +121,7 @@ def process_workbook(source_path: Path, copy_path: Path):
             for item in conflicts:
                 f.write(
                     f"Sheet={item['sheet']}, Row={item['row']}, "
-                    f"ExistingJ={item['existing_value']}, Proposed={item['proposed_value']}\n"
+                    f"Existing content={item['existing_value']}, Proposed={item['proposed_value']}\n"
                 )
         print(f"[6/7] {len(conflicts)} conflict(s) saved to: {CONFLICT_PATH}")
     else:
