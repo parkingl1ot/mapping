@@ -85,43 +85,51 @@ def process_workbook(source_path: Path, copy_path: Path):
         max_row = sheet.max_row
         print(f"  - Data rows checked: {max_row - 1}")
 
-        for category in summary.keys():
-            for row_idx in range(2, max_row + 1):
-                total_rows_processed += 1
-                try:
-                    ex_value = sheet.cell(row=row_idx, column=summary_index).value
-                    trigger_hit = False
+        summary_mappings = [summary1, summary2, summary3]
+        assigned_summary_priority = {}
+        for priority, summary_mapping in enumerate(summary_mappings):
+            for category in summary_mapping.keys():
+                for row_idx in range(2, max_row + 1):
+                    total_rows_processed += 1
+                    try:
+                        ex_value = sheet.cell(row=row_idx, column=summary_index).value
+                        trigger_hit = False
 
-                    for col_idx in summary_triggers:
-                        cell_value = sheet.cell(row=row_idx, column=col_idx).value
-                        if contains_keyword(cell_value, summary.get(category)):
-                            trigger_hit = True
-                            break
+                        for col_idx in summary_triggers:
+                            cell_value = sheet.cell(row=row_idx, column=col_idx).value
+                            if contains_keyword(cell_value, summary_mapping.get(category)):
+                                trigger_hit = True
+                                break
 
-                    if not trigger_hit:
-                        continue
+                        if not trigger_hit:
+                            continue
 
-                    if ex_value:
-                        conflicts.append({
-                            "sheet": sheet.title,
-                            "row": row_idx,
-                            "existing_value": ex_value,
-                            "proposed_value": category,
-                            "trigger_columns": [str(get_column_letter(c) for c in summary_triggers)],
-                        })
-                        print(
-                            f"  - 摘要conflict at sheet={sheet.title}, row={row_idx}: "
-                            f"existing content='{ex_value}', proposed '{category}'."
-                        )
-                        continue
+                        assigned_priority = assigned_summary_priority.get(row_idx)
+                        if assigned_priority is not None and assigned_priority < priority:
+                            continue
 
-                    sheet.cell(row=row_idx, column=summary_index, value=category)
-                    total_updates += 1
-                    print(f"  - 摘要Updated sheet={sheet.title}, row={row_idx} => {category}")
-                except Exception as exc:
-                    errors.append((sheet.title, row_idx, str(exc)))
-                    log_error(f"摘要Error while processing sheet={sheet.title}, row={row_idx}", exc)
-                    print(f"  - 摘要Error on sheet={sheet.title}, row={row_idx}: {exc}")
+                        if ex_value:
+                            conflicts.append({
+                                "sheet": sheet.title,
+                                "row": row_idx,
+                                "existing_value": ex_value,
+                                "proposed_value": category,
+                                "trigger_columns": [str(get_column_letter(c) for c in summary_triggers)],
+                            })
+                            print(
+                                f"  - 摘要conflict at sheet={sheet.title}, row={row_idx}: "
+                                f"existing content='{ex_value}', proposed '{category}'."
+                            )
+                            continue
+
+                        sheet.cell(row=row_idx, column=summary_index, value=category)
+                        assigned_summary_priority[row_idx] = priority
+                        total_updates += 1
+                        print(f"  - 摘要Updated sheet={sheet.title}, row={row_idx} => {category}")
+                    except Exception as exc:
+                        errors.append((sheet.title, row_idx, str(exc)))
+                        log_error(f"摘要Error while processing sheet={sheet.title}, row={row_idx}", exc)
+                        print(f"  - 摘要Error on sheet={sheet.title}, row={row_idx}: {exc}")
 
         for category in account.keys():
             for row_idx in range(2, max_row + 1):
