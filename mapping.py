@@ -1,17 +1,49 @@
+import json
+import os
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
-
-from mapping_list import *
 
 
-SOURCE_FILE = Path(r"C:\Users\xlin075\Documents\mapping\Book.xlsx")
+SOURCE_FILE = Path(r"C:\Users\xlin075\Documents\mapping\Book1.xlsx")
 OUTPUT_DIR = SOURCE_FILE.parent
 LOG_PATH = OUTPUT_DIR / "processing_error_log.txt"
-CONFLICT_PATH = OUTPUT_DIR / "mapping_conflicts.txt"
+ERROR_PATH = OUTPUT_DIR / "mapping_errors.txt"
+SUMMARY_LIST_PATH = OUTPUT_DIR / "summary_keywords.json"
+
+API_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+API_KEY = os.getenv("DEEPSEEK_API_KEY")
+MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+BATCH_SIZE = int(os.getenv("MAPPING_BATCH_SIZE", "50"))
+
+SUMMARY_KEYWORDS = [
+    "\u7968\u636e\u53ca\u6e05\u7b97",
+    "\u624b\u7eed\u8d39/\u670d\u52a1\u8d39/\u4ea4\u6613\u8d39",
+    "\u6c34\u7535\u53ca\u901a\u8baf\u8d39\u7528",
+    "\u884c\u653f\u53ca\u529e\u516c\u8d39\u7528",
+    "\u79df\u91d1",
+    "\u5229\u606f",
+    "\u5b58\u6b3e",
+    "\u4eba\u4e8b\u8d39\u7528",
+    "\u5de5\u7a0b\u53ca\u88c5\u4fee\u6b3e",
+    "\u91c7\u8d2d\u6b3e",
+    "\u4e13\u4e1a\u670d\u52a1\u8d39",
+    "\u4ea4\u901a\u53ca\u5dee\u65c5\u8d39",
+    "\u62bc\u91d1\u4fdd\u8bc1\u91d1",
+    "\u4e1a\u52a1\u8d27\u6b3e",
+    "\u4fdd\u9669\u57fa\u91d1\u6536\u5165",
+    "\u501f\u6b3e",
+    "\u5907\u7528\u91d1",
+    "\u62a5\u9500\u6b3e",
+    "\u7a0e\u52a1\u8d39\u7528",
+    "\u5f80\u6765\u6b3e",
+]
 
 
 def log_error(message: str, exc: Exception | None = None) -> None:
@@ -19,22 +51,8 @@ def log_error(message: str, exc: Exception | None = None) -> None:
     text = f"[{timestamp}] {message}\n"
     if exc is not None:
         text += traceback.format_exc() + "\n"
-    with LOG_PATH.open("a", encoding="utf-8") as f:
-        f.write(text)
-
-def normalise_text(s): 
-    if s is None:
-        return ""
-    return ''.join(ch for ch in str(s).upper() if ch.isalnum())
-
-def contains_keyword(value, category) -> bool:
-    if not value:
-        return False
-    norm_value = normalise_text(value)
-    for keyword in category:
-        if keyword in norm_value:
-            return True
-    return False
+    with LOG_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(text)
 
 
 def make_copy_path() -> Path:
@@ -42,166 +60,199 @@ def make_copy_path() -> Path:
     return OUTPUT_DIR / f"Book_copy_{timestamp}.xlsx"
 
 
-def get_header_lookup(ws):
-    for row in ws.iter_rows(min_row=1, max_row=min(ws.max_row, 20), values_only=True):
-        cell_count = sum(1 for v in row if v is not None)
-        if cell_count>11:
-            return {str(v).strip(): idx + 1 for idx, v in enumerate(row) if v is not None}
-    return {}
+def get_header_lookup(ws: Any) -> tuple[int, dict[str, int]]:
+    scan_columns = min(ws.max_column, 100)
+    for row_number in range(1, min(ws.max_row, 20) + 1):
+        values = [ws.cell(row_number, column).value for column in range(1, scan_columns + 1)]
+        headers = {
+            str(value).strip(): column
+            for column, value in enumerate(values, 1)
+            if value is not None and str(value).strip()
+        }
+        if "\u6458\u8981mapping" in headers and "\u6237\u540dmapping" in headers:
+            return row_number, headers
+    return 0, {}
 
 
-def process_workbook(source_path: Path, copy_path: Path):
-    print("[1/7] Loading workbook from:", source_path)
-    wb = load_workbook(source_path, data_only=False)
-    print("[2/7] Workbook loaded. Sheets:", wb.sheetnames)
+def request_json(system_prompt: str, user_prompt: str) -> dict[str, Any]:
+    if not API_KEY:
+        raise RuntimeError(
+            "DEEPSEEK_API_KEY is not set. Set it in the process environment; "
+            "the key must not be written to source files."
+        )
 
-    print("[3/7] Creating workbook copy at:", copy_path)
-    wb.save(copy_path)
-    copied_wb = load_workbook(copy_path, data_only=False)
+    payload = {
+        "model": MODEL,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+    request = Request(
+        f"{API_URL}/chat/completions",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=180) as response:
+            response_data = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"API request failed with HTTP {exc.code}: {body}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"API request failed: {exc.reason}") from exc
 
-    errors = []
-    conflicts = []
-    total_rows_processed = 0
-    total_updates = 0
-
-    for sheet in copied_wb.worksheets:
-        print(f"[4/7] Processing sheet: {sheet.title}")
-        header_lookup = get_header_lookup(sheet)
-        summary_index = header_lookup.get("摘要mapping")
-        account_index = header_lookup.get("户名mapping")
-        summary_triggers = [9, 11, 16, 17]
-        account_triggers = [header_lookup.get("对方户名")]
-
-        if "摘要mapping" not in header_lookup:
-            log_error(f"  - No '摘要mapping' header found in {sheet.title}, please check the format of the book", Exception)
-            print(f"  - No '摘要mapping' header found in {sheet.title}")
-            continue
-
-        if "户名mapping" not in header_lookup:
-            log_error(f"  - No '户名mapping' header found in {sheet.title}, please check the format of the book", Exception)
-            print(f"  - No '户名mapping' header found in {sheet.title}")
-            continue
-
-        max_row = sheet.max_row
-        print(f"  - Data rows checked: {max_row - 1}")
-
-        summary_mappings = [summary1, summary2, summary3]
-        assigned_summary_priority = {}
-        for priority, summary_mapping in enumerate(summary_mappings):
-            for category in summary_mapping.keys():
-                for row_idx in range(2, max_row + 1):
-                    total_rows_processed += 1
-                    try:
-                        ex_value = sheet.cell(row=row_idx, column=summary_index).value
-                        trigger_hit = False
-
-                        for col_idx in summary_triggers:
-                            cell_value = sheet.cell(row=row_idx, column=col_idx).value
-                            if contains_keyword(cell_value, summary_mapping.get(category)):
-                                trigger_hit = True
-                                break
-
-                        if not trigger_hit:
-                            continue
-
-                        assigned_priority = assigned_summary_priority.get(row_idx)
-                        if assigned_priority is not None and assigned_priority < priority:
-                            continue
-
-                        if ex_value:
-                            conflicts.append({
-                                "sheet": sheet.title,
-                                "row": row_idx,
-                                "existing_value": ex_value,
-                                "proposed_value": category,
-                                "trigger_columns": [str(get_column_letter(c) for c in summary_triggers)],
-                            })
-                            print(
-                                f"  - 摘要conflict at sheet={sheet.title}, row={row_idx}: "
-                                f"existing content='{ex_value}', proposed '{category}'."
-                            )
-                            continue
-
-                        sheet.cell(row=row_idx, column=summary_index, value=category)
-                        assigned_summary_priority[row_idx] = priority
-                        total_updates += 1
-                        print(f"  - 摘要Updated sheet={sheet.title}, row={row_idx} => {category}")
-                    except Exception as exc:
-                        errors.append((sheet.title, row_idx, str(exc)))
-                        log_error(f"摘要Error while processing sheet={sheet.title}, row={row_idx}", exc)
-                        print(f"  - 摘要Error on sheet={sheet.title}, row={row_idx}: {exc}")
-
-        for category in account.keys():
-            for row_idx in range(2, max_row + 1):
-                total_rows_processed += 1
-                try:
-                    ex_value = sheet.cell(row=row_idx, column=account_index).value
-                    trigger_hit = False
-
-                    for col_idx in account_triggers:
-                        cell_value = sheet.cell(row=row_idx, column=col_idx).value
-                        if contains_keyword(cell_value, account.get(category)):
-                            trigger_hit = True
-                            break
-
-                    if not trigger_hit:
-                        continue
-
-                    if ex_value:
-                        conflicts.append({
-                            "sheet": sheet.title,
-                            "row": row_idx,
-                            "existing_value": ex_value,
-                            "proposed_value": category,
-                        })
-                        print(
-                            f"  - 户名conflict at sheet={sheet.title}, row={row_idx}: "
-                            f"existing content='{ex_value}', proposed '{category}'."
-                        )
-                        continue
-
-                    sheet.cell(row=row_idx, column=account_index, value=category)
-                    total_updates += 1
-                    print(f"  - 户名Updated sheet={sheet.title}, row={row_idx} => {category}")
-                except Exception as exc:
-                    errors.append((sheet.title, row_idx, str(exc)))
-                    log_error(f"户名Error while processing sheet={sheet.title}, row={row_idx}", exc)
-                    print(f"  - 户名Error on sheet={sheet.title}, row={row_idx}: {exc}")
+    try:
+        content = response_data["choices"][0]["message"]["content"]
+        result = json.loads(content)
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"API returned an invalid JSON response: {response_data}") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("API returned JSON that is not an object.")
+    return result
 
 
-    print("[5/7] Saving updated workbook copy...")
-    copied_wb.save(copy_path)
+def batched(values: list[str], size: int) -> list[list[str]]:
+    return [values[index : index + size] for index in range(0, len(values), size)]
 
-    if conflicts:
-        with CONFLICT_PATH.open("w", encoding="utf-8") as f:
-            f.write("Conflict report\n")
-            f.write("================\n")
-            for item in conflicts:
-                f.write(
-                    f"Sheet={item['sheet']}, Row={item['row']}, "
-                    f"Existing content={item['existing_value']}, Proposed={item['proposed_value']}\n"
+
+def map_summaries(values: list[str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    system = (
+        "You classify Chinese bank transaction summaries. Choose exactly one category "
+        "from the supplied keyword list for every input. Use the transaction meaning, "
+        "not merely one matching character. Return JSON with an object named "
+        "'mappings'; each input string must be a key and its value must be exactly one "
+        "keyword from the list."
+    )
+    for batch in batched(values, BATCH_SIZE):
+        user = json.dumps(
+            {"keywords": SUMMARY_KEYWORDS, "summaries": batch},
+            ensure_ascii=False,
+        )
+        response = request_json(system, user)
+        mappings = response.get("mappings")
+        if not isinstance(mappings, dict):
+            raise RuntimeError(f"Summary response has no valid mappings object: {response}")
+        for source in batch:
+            target = mappings.get(source)
+            if target not in SUMMARY_KEYWORDS:
+                raise RuntimeError(
+                    f"Summary mapping for {source!r} is not a supplied keyword: {target!r}"
                 )
-        print(f"[6/7] {len(conflicts)} conflict(s) saved to: {CONFLICT_PATH}")
-    else:
-        CONFLICT_PATH.write_text("No conflicts detected.\n", encoding="utf-8")
-        print("[6/7] No conflicts detected.")
+            result[source] = target
+        time.sleep(0.1)
+    return result
+
+
+def map_accounts(values: list[str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    system = (
+        "You normalize Chinese bank counterparty account names. Return JSON with an "
+        "object named 'mappings'. For each input, map it to a canonical account name. "
+        "Only merge names when differences are clearly typographical, punctuation, "
+        "spacing, legal suffix, or an obvious minor writing error. Do not merge "
+        "different companies merely because they are similar. Preserve the original "
+        "input as the canonical value when unsure. Every input must be a key."
+    )
+    for batch in batched(values, BATCH_SIZE):
+        user = json.dumps({"account_names": batch}, ensure_ascii=False)
+        response = request_json(system, user)
+        mappings = response.get("mappings")
+        if not isinstance(mappings, dict):
+            raise RuntimeError(f"Account response has no valid mappings object: {response}")
+        for source in batch:
+            target = mappings.get(source)
+            if not isinstance(target, str) or not target.strip():
+                raise RuntimeError(f"Account mapping for {source!r} is invalid: {target!r}")
+            result[source] = target.strip()
+        time.sleep(0.1)
+    return result
+
+
+def process_workbook(source_path: Path, copy_path: Path) -> None:
+    if not source_path.exists():
+        raise FileNotFoundError(source_path)
+    if not API_KEY:
+        raise RuntimeError("DEEPSEEK_API_KEY is required.")
+
+    workbook = load_workbook(source_path, data_only=False)
+    errors: list[str] = []
+    sheets: list[tuple[Any, int, dict[str, int]]] = []
+    summary_values: set[str] = set()
+    account_values: set[str] = set()
+
+    for sheet in workbook.worksheets:
+        header_row, headers = get_header_lookup(sheet)
+        if not headers:
+            errors.append(f"{sheet.title}: required headers were not found")
+            continue
+        sheets.append((sheet, header_row, headers))
+        summary_column = headers["\u6458\u8981mapping"]
+        account_column = headers["\u6237\u540dmapping"]
+        summary_source_column = headers.get("\u6458\u8981\u63cf\u8ff0")
+        account_source_column = headers.get("\u5bf9\u65b9\u6237\u540d")
+        if summary_source_column is None or account_source_column is None:
+            errors.append(f"{sheet.title}: summary or account source header was not found")
+            continue
+        for row in range(header_row + 1, sheet.max_row + 1):
+            if sheet.cell(row, summary_column).value not in (None, ""):
+                errors.append(f"{sheet.title}!{sheet.cell(row, summary_column).coordinate} is not empty")
+            if sheet.cell(row, account_column).value not in (None, ""):
+                errors.append(f"{sheet.title}!{sheet.cell(row, account_column).coordinate} is not empty")
+            summary = sheet.cell(row, summary_source_column).value
+            account = sheet.cell(row, account_source_column).value
+            if summary not in (None, ""):
+                summary_values.add(str(summary))
+            if account not in (None, ""):
+                account_values.add(str(account))
 
     if errors:
-        print(f"[7/7] Finished with {len(errors)} error(s). Please review {LOG_PATH}.")
-    else:
-        print(f"[7/7] Finished successfully. Updated {total_updates} row(s). Processed {total_rows_processed} row(s).")
+        ERROR_PATH.write_text("\n".join(errors) + "\n", encoding="utf-8")
+        raise RuntimeError(
+            f"Input validation failed with {len(errors)} error(s); see {ERROR_PATH}."
+        )
 
-    if conflicts:
-        print("NOTICE: There are column J conflicts. The original value has been preserved and the user must manually handle these rows.")
+    SUMMARY_LIST_PATH.write_text(
+        json.dumps(SUMMARY_KEYWORDS, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    summary_mappings = map_summaries(sorted(summary_values))
+    account_mappings = map_accounts(sorted(account_values))
+
+    output = load_workbook(source_path, data_only=False)
+    output_sheets = {sheet.title: sheet for sheet in output.worksheets}
+    for source_sheet, header_row, headers in sheets:
+        sheet = output_sheets[source_sheet.title]
+        summary_column = headers["\u6458\u8981mapping"]
+        account_column = headers["\u6237\u540dmapping"]
+        summary_source_column = headers["\u6458\u8981\u63cf\u8ff0"]
+        account_source_column = headers["\u5bf9\u65b9\u6237\u540d"]
+        for row in range(header_row + 1, sheet.max_row + 1):
+            summary = sheet.cell(row, summary_source_column).value
+            account = sheet.cell(row, account_source_column).value
+            if summary not in (None, ""):
+                sheet.cell(row, summary_column, summary_mappings[str(summary)])
+            if account not in (None, ""):
+                sheet.cell(row, account_column, account_mappings[str(account)])
+    output.save(copy_path)
+    print(f"Created: {copy_path}")
+    print(f"Summary keywords: {len(SUMMARY_KEYWORDS)}")
+    print(f"Unique summaries mapped: {len(summary_mappings)}")
+    print(f"Unique account names mapped: {len(account_mappings)}")
 
 
-def main():
-    copy_path = make_copy_path()
+def main() -> None:
     try:
-        process_workbook(SOURCE_FILE, copy_path)
+        process_workbook(SOURCE_FILE, make_copy_path())
     except Exception as exc:
         log_error("Fatal script error.", exc)
-        print("FATAL ERROR: The program encountered a critical error. See processing_error_log.txt for details.")
         raise
 
 
